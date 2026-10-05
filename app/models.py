@@ -29,6 +29,14 @@ class FailureReason(str, enum.Enum):
     SIGNATURE_MISMATCH = "signature_mismatch"  # 签名不匹配
     WRONG_PASSPHRASE = "wrong_passphrase"      # 口令错误或密文篡改
     CORRUPT_ARCHIVE = "corrupt_archive"        # 归档结构/版本关系不完整
+    NONCE_LOG_FULL = "nonce_log_full"          # 流水容量打满且无可清理记录
+
+
+class JournalOutcome(str, enum.Enum):
+    """请求流水记录的结论。"""
+
+    ACCEPTED = "accepted"    # 首次出现，放行
+    REPLAYED = "replayed"    # 随机数重复，拒绝
 
 
 # 允许的状态迁移表：源状态 -> 允许的目标状态集合
@@ -90,3 +98,27 @@ class VerifyResult:
     ok: bool
     reason: FailureReason | None = None
     detail: str = ""
+
+
+@dataclass
+class NonceRecord:
+    """请求流水里的一条记录。"""
+
+    seq: int                 # 单调序号，决定稳定排序
+    key_id: str
+    version: int
+    nonce: str
+    timestamp: float         # 请求自带时间戳
+    recorded_at: float       # 判定发生的本地时间
+    outcome: JournalOutcome
+    basis: str               # 判定依据（人类可读，可对账）
+
+
+@dataclass
+class AuditFilter:
+    """流水查询过滤条件；None 表示不限制该维度。"""
+
+    key_id: str | None = None
+    version: int | None = None
+    start: float | None = None   # recorded_at 下界（含）
+    end: float | None = None     # recorded_at 上界（含）

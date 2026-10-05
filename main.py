@@ -14,9 +14,12 @@ from app.vault import CorruptArchiveError, WrongPassphraseError
 
 STATE_PATH = os.environ.get("KMS_STATE_PATH", "keystore_state.json")
 WINDOW = float(os.environ.get("KMS_WINDOW_SECONDS", "300"))
+RETENTION = float(os.environ.get("KMS_RETENTION_SECONDS", str(WINDOW)))
+NONCE_CAPACITY = int(os.environ.get("KMS_NONCE_CAPACITY", "1000000"))
 
 app = FastAPI(title="local-kms")
-service = KeyService(STATE_PATH, WINDOW)
+service = KeyService(STATE_PATH, WINDOW, retention_seconds=RETENTION,
+                     nonce_capacity=NONCE_CAPACITY)
 
 
 class SignIn(BaseModel):
@@ -121,7 +124,11 @@ def verify(body: VerifyIn) -> dict:
         method=body.method.upper(), payload=base64.b64decode(body.payload_b64),
         key_id=body.key_id, version=body.version, timestamp=body.timestamp,
         nonce=body.nonce, signature=base64.b64decode(body.signature_b64))
-    return _result_dict(service.verify(req))
+    res = service.verify(req)
+    # 容量打满是可预期的拒绝，返回 503 以便和其它 4xx 失败区分
+    if not res.ok and res.reason.value == "nonce_log_full":
+        raise HTTPException(503, _result_dict(res))
+    return _result_dict(res)
 
 
 @app.post("/export")
@@ -138,3 +145,26 @@ def restore(body: RestoreIn) -> dict:
     except CorruptArchiveError as exc:
         raise HTTPException(422, {"reason": "corrupt_archive", "detail": str(exc)})
     return {"ok": True}
+
+
+# ---- 审计：查询与对账导出（只读） ----------------------------------------
+@app.get("/audit/records")
+def audit_records(key_id: str | None = None, version: int | None = None,
+                  start: float | None = None, end: float | None = None) -> dict:
+    records = service.query_records(key_id, version, start, end)
+    return {"count": len(records),
+            "records": [
+                {"seq": r.seq, "key_id": r.key_id, "version": r.version,
+                 "nonce": r.nonce, "timestamp": r.timestamp,
+                 "recorded_at": r.recorded_at, "outcome": r.outcome.value,
+                 "basis": r.basis}
+                for r in records]}
+
+
+@app.get("/audit/export")
+def audit_export() -> dict:
+    blob = service.export_audit()
+    from app.audit import Auditor
+    return {"format": "kms-audit-v1",
+            "digest": Auditor.digest(blob),
+            "blob_b64": base64.b64encode(blob).decode()}
