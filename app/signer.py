@@ -1,4 +1,4 @@
-"""请求签名、验签与重放防护（随机数按时间淘汰）。"""
+"""请求签名、验签与重放防护（流水由 RequestLedger 持久化）。"""
 from __future__ import annotations
 
 import threading
@@ -6,35 +6,14 @@ import uuid
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 from .keystore import KeyStore
-from .models import FailureReason, KeyState, SignedRequest, VerifyResult
-
-
-class NonceStore:
-    """随机数流水：记录已见 nonce，按时间窗淘汰，避免无界增长。"""
-
-    def __init__(self, window_seconds: float) -> None:
-        self._lock = threading.Lock()
-        self._window = window_seconds
-        self._seen: dict[str, float] = {}
-
-    def check_and_record(self, nonce: str, now: float) -> bool:
-        """nonce 未见过则记录并返回 True，重复返回 False；同时淘汰过期记录。"""
-        with self._lock:
-            cutoff = now - self._window
-            stale = [n for n, ts in self._seen.items() if ts < cutoff]
-            for n in stale:
-                del self._seen[n]
-            if nonce in self._seen:
-                return False
-            self._seen[nonce] = now
-            return True
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._seen)
+from .ledger import CapacityExceededError, RequestLedger
+from .models import FailureReason, KeyState, LedgerRecord, SignedRequest, VerifyResult
 
 
 def _fail(reason: FailureReason, detail: str) -> VerifyResult:
@@ -42,18 +21,24 @@ def _fail(reason: FailureReason, detail: str) -> VerifyResult:
 
 
 class Signer:
-    """签名与验签，结论含可区分失败原因。"""
+    """签名与验签，结论含可区分失败原因。
 
-    def __init__(self, store: KeyStore, window_seconds: float = 300.0) -> None:
+    验签通过的请求把 nonce 记入 RequestLedger（随状态文件落盘），
+    重启或多进程下重复判定一致；伪造签名的请求不占用 nonce。
+    """
+
+    def __init__(self, store: KeyStore, window_seconds: float,
+                 ledger: RequestLedger) -> None:
         self._store = store
         self._window = window_seconds
-        self._nonces = NonceStore(window_seconds)
+        self._ledger = ledger
         # 外部可注入同一把锁，保证“轮转与验签”在服务层面串行化
         self._lock = threading.RLock()
 
     @property
-    def nonces(self) -> NonceStore:
-        return self._nonces
+    def nonces(self) -> RequestLedger:
+        """已受理请求的流水（重放判定集合）。"""
+        return self._ledger
 
     def bind_lock(self, lock: threading.RLock) -> None:
         self._lock = lock
@@ -79,10 +64,12 @@ class Signer:
                              f"{key_id} v{latest.version} is revoked")
             if nonce is None:
                 nonce = uuid.uuid4().hex
-            priv = serialization.load_pem_private_key(kv.private_key_pem, password=None)
+            priv = serialization.load_pem_private_key(kv.private_key_pem,
+                                                      password=None)
             assert isinstance(priv, Ed25519PrivateKey)
-            req = SignedRequest(method=method.upper(), payload=payload, key_id=key_id,
-                                version=kv.version, timestamp=now, nonce=nonce)
+            req = SignedRequest(method=method.upper(), payload=payload,
+                                key_id=key_id, version=kv.version,
+                                timestamp=now, nonce=nonce)
             req.signature = priv.sign(req.canonical_bytes())
             return req
 
@@ -101,12 +88,12 @@ class Signer:
             if kv.state == KeyState.PENDING:
                 return _fail(FailureReason.KEY_PENDING,
                              f"{req.key_id} v{req.version} not active yet")
-            if kv.state == KeyState.VERIFY_ONLY:
-                if (kv.verify_only_until is not None
-                        and now >= kv.verify_only_until):
-                    return _fail(FailureReason.TRANSITION_EXPIRED,
-                                 f"transition window ended at {kv.verify_only_until}"
-                                 f" (now={now})")
+            if (kv.state == KeyState.VERIFY_ONLY
+                    and kv.verify_only_until is not None
+                    and now >= kv.verify_only_until):
+                return _fail(FailureReason.TRANSITION_EXPIRED,
+                             f"transition window ended at {kv.verify_only_until}"
+                             f" (now={now})")
 
             # 2) 时间窗
             drift = now - req.timestamp
@@ -123,8 +110,18 @@ class Signer:
                 return _fail(FailureReason.SIGNATURE_MISMATCH,
                              "signature does not verify against canonical request")
 
-            # 4) 重放：仅合法签名才记录 nonce
-            if not self._nonces.check_and_record(req.nonce, now):
+            # 4) 重放：仅合法签名才记录 nonce；容量满则明确拒绝
+            record = LedgerRecord(
+                nonce=req.nonce, key_id=req.key_id, version=req.version,
+                request_timestamp=req.timestamp, decided_at=now,
+                decision="accepted",
+                basis=(f"key_state={kv.state.value}; timestamp_in_window; "
+                       f"signature_ok; nonce_fresh"))
+            try:
+                fresh = self._ledger.check_and_record(record, now)
+            except CapacityExceededError as exc:
+                return _fail(FailureReason.LEDGER_CAPACITY_EXCEEDED, str(exc))
+            if not fresh:
                 return _fail(FailureReason.NONCE_REUSED,
                              f"nonce {req.nonce!r} already used")
 

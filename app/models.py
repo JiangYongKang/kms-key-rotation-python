@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import enum
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 class KeyState(str, enum.Enum):
@@ -29,6 +29,7 @@ class FailureReason(str, enum.Enum):
     SIGNATURE_MISMATCH = "signature_mismatch"  # 签名不匹配
     WRONG_PASSPHRASE = "wrong_passphrase"      # 口令错误或密文篡改
     CORRUPT_ARCHIVE = "corrupt_archive"        # 归档结构/版本关系不完整
+    LEDGER_CAPACITY_EXCEEDED = "ledger_capacity_exceeded"  # 流水容量已满且无可清理记录
 
 
 # 允许的状态迁移表：源状态 -> 允许的目标状态集合
@@ -90,3 +91,25 @@ class VerifyResult:
     ok: bool
     reason: FailureReason | None = None
     detail: str = ""
+
+
+@dataclass
+class LedgerConfig:
+    """请求流水的保留期与容量上限。"""
+
+    retention_seconds: float  # 保留期：窗口内记录绝不提前清理
+    max_records: int          # 容量上限：顶满且无可清理记录时拒绝新请求
+
+
+@dataclass
+class LedgerRecord:
+    """一条请求流水记录：结论与判定依据，用于重放防护与审计对账。"""
+
+    nonce: str
+    key_id: str
+    version: int
+    request_timestamp: float  # 请求自带时间戳
+    decided_at: float         # 判定时刻（本地时钟）
+    decision: str             # 结论，如 "accepted"
+    basis: str                # 判定依据（各检查项结论）
+    reason: str | None = None  # 失败原因（仅拒绝时）

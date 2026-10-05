@@ -7,8 +7,12 @@ import logging
 
 import pytest
 
-from app.vault import (CorruptArchiveError, WrongPassphraseError,
-                       export_sealed, import_sealed)
+from app.vault import (
+    CorruptArchiveError,
+    WrongPassphraseError,
+    export_sealed,
+    import_sealed,
+)
 
 log = logging.getLogger("test.vault")
 
@@ -76,6 +80,7 @@ def test_broken_version_chain_rejected(versions):
     env = json.loads(blob)
     # 用正确口令解出明文，删掉 v1 后重新加密（模拟不完整归档）
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
     from app.vault import _derive_key
     salt = base64.b64decode(env["kdf"]["salt"])
     key = _derive_key("pw", salt, env["kdf"]["iterations"])
